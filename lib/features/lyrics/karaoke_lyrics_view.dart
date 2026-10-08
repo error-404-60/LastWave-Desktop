@@ -140,6 +140,159 @@ class _ParticleClockScopeState extends State<_ParticleClockScope>
   Widget build(BuildContext context) => widget.child;
 }
 
+/// Post-frame anchor probe for the particle emitter. While particles are
+/// enabled it refreshes [onAnchor] with the current active lyric line's
+/// position, in the lyrics Stack's local coordinates:
+/// - Apple line-sync mode: via a [GlobalKey] on the active row (cheap —
+///   only runs when the highlight actually changes).
+/// - Word-by-word mode: by locating flutter_lyric's internal ListView
+///   element once and indexing its currently visible children.
+/// When disabled it renders nothing and does zero work — the effect
+/// costs literally nothing until turned on in Settings.
+class _ParticleAnchorProbe extends StatefulWidget {
+  final bool enabled;
+  final LyricsResult result;
+  final ValueNotifier<int> positionListenable;
+  final ValueNotifier<int> activeLine;
+  /// Global key attached to the active row in Apple line-sync mode.
+  final GlobalKey activeRowKey;
+  /// The lyrics area subtree to search for flutter_lyric's list view.
+  final GlobalKey stackKey;
+  final bool wordByWord;
+  final void Function(Offset anchor) onAnchor;
+
+  const _ParticleAnchorProbe({
+    required this.enabled,
+    required this.result,
+    required this.positionListenable,
+    required this.activeLine,
+    required this.activeRowKey,
+    required this.stackKey,
+    required this.wordByWord,
+    required this.onAnchor,
+  });
+
+  @override
+  State<_ParticleAnchorProbe> createState() => _ParticleAnchorProbeState();
+}
+
+class _ParticleAnchorProbeState extends State<_ParticleAnchorProbe> {
+  int _lastSampled = -2;
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.enabled) {
+      widget.activeLine.addListener(_sample);
+      WidgetsBinding.instance.addPostFrameCallback((_) => _sample());
+    }
+  }
+
+  @override
+  void didUpdateWidget(covariant _ParticleAnchorProbe oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.enabled != widget.enabled) {
+      if (widget.enabled) {
+        widget.activeLine.addListener(_sample);
+        WidgetsBinding.instance.addPostFrameCallback((_) => _sample());
+      } else {
+        widget.activeLine.removeListener(_sample);
+      }
+    } else if (widget.enabled && oldWidget.wordByWord != widget.wordByWord) {
+      _sample();
+    }
+  }
+
+  @override
+  void dispose() {
+    widget.activeLine.removeListener(_sample);
+    super.dispose();
+  }
+
+  void _sample() {
+    if (!mounted || !widget.enabled) return;
+    final idx = widget.activeLine.value;
+    // In word-by-word mode the wipe moves inside a line; resample even
+    // when the index is unchanged, but only from frame callbacks.
+    if (!widget.wordByWord && idx == _lastSampled) return;
+    _lastSampled = idx;
+    widget.onAnchor(widget.wordByWord ? _wordByWordAnchor() : _rowAnchor(idx));
+  }
+
+  Offset _rowAnchor(int idx) {
+    if (idx < 0) return const Offset(-1, -1);
+    final rowCtx = widget.activeRowKey.currentContext;
+    return _anchorInStack(rowCtx);
+  }
+
+  Offset _wordByWordAnchor() {
+    // flutter_lyric renders a ListView whose first visible child is the
+    // active line (it auto-scrolls the current line to `defaultAlignment`
+    // near the top). Find that ListView element without importing the
+    // package's private widgets: any Scrollable under the stack works.
+    final stackCtx = widget.stackKey.currentContext;
+    if (stackCtx == null) return const Offset(-1, -1);
+    Offset? found;
+    void visit(Element e) {
+      if (found != null) return;
+      final w = e.widget;
+      if (w is ListView || w.runtimeType.toString().contains('ListView')) {
+        final ro = e.renderObject;
+        if (ro is RenderAbstractViewport) {
+          final vis = ro.getVisibleBounds(ro);
+          found = Offset(vis.center.dx, vis.center.dy);
+          return;
+        }
+      }
+      e.visitChildren(visit);
+    }
+
+    try {
+      (stackCtx as Element).visitChildren(visit);
+    } catch (_) {}
+    if (found == null) return const Offset(-1, -1);
+    return _toStackLocal(found!);
+  }
+
+  Offset _anchorInStack(BuildContext? ctx) {
+    if (ctx == null) return const Offset(-1, -1);
+    try {
+      final box = ctx.findRenderObject();
+      final stackBox = widget.stackKey.currentContext?.findRenderObject();
+      if (box is! RenderBox || !box.hasSize || stackBox is! RenderBox) {
+        return const Offset(-1, -1);
+      }
+      final topLeft = box.localToGlobal(Offset.zero, ancestor: stackBox);
+      return Offset(topLeft.dx + box.size.width * 0.5,
+          topLeft.dy + box.size.height * 0.5);
+    } catch (_) {
+      return const Offset(-1, -1);
+    }
+  }
+
+  Offset _toStackLocal(Offset globalCenter) {
+    final stackBox = widget.stackKey.currentContext?.findRenderObject();
+    if (stackBox is! RenderBox) return const Offset(-1, -1);
+    try {
+      final local = globalCenter - stackBox.localToGlobal(Offset.zero);
+      return Offset(local.dx, local.dy);
+    } catch (_) {
+      return const Offset(-1, -1);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (!widget.enabled) return const SizedBox.shrink();
+    // Resample the karaoke anchor whenever a new frame lands while the
+    // highlight is mid-line (post-frame loop stops when disabled).
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && widget.enabled && widget.wordByWord) _sample();
+    });
+    return const SizedBox.shrink();
+  }
+}
+
 /// Provider for track-specific lyrics timing offset in milliseconds.
 final lyricsOffsetProvider = StateNotifierProvider.family<LyricsOffsetNotifier, int, String>(
   (ref, trackKey) {
@@ -285,11 +438,19 @@ class _WaveKaraokeLyricsViewState extends ConsumerState<WaveKaraokeLyricsView>
   // Anchor of the highlighted line in the lyrics Stack's local coords,
   // refreshed by a lightweight post-frame probe (no extra listeners).
   Offset _particleAnchor = const Offset(-1, -1);
+  // Keys used by the anchor probe to locate the highlighted line.
+  final GlobalKey _lyricStackKey = GlobalKey();
+  final GlobalKey _appleActiveRowKey = GlobalKey();
 
   @override
   void initState() {
     super.initState();
     _lyricController = LyricController();
+    // Mirror flutter_lyric's active-line notifier into [_activeLine] so
+    // particle bursts fire on line transitions in word-by-word mode.
+    // (Public field of LyricController in flutter_lyric 3.x — note the
+    // package's own spelling "activeIndexNotifiter".)
+    _lyricController.activeIndexNotifiter.addListener(_onLyricActiveChanged);
     _lyricController.setOnTapLineCallback((duration) {
       final seekTargetMs = duration.inMilliseconds + _offsetMs;
       ref.read(playbackServiceProvider.notifier).seek(
@@ -329,6 +490,15 @@ class _WaveKaraokeLyricsViewState extends ConsumerState<WaveKaraokeLyricsView>
     }
   }
 
+  /// Mirrors flutter_lyric's active line into [_activeLine] (word-by-word
+  /// mode). Only notifies on change, so particle bursts stay event-driven.
+  void _onLyricActiveChanged() {
+    try {
+      final idx = _lyricController.activeIndexNotifiter.value;
+      if (_activeLine.value != idx) _activeLine.value = idx;
+    } catch (_) {}
+  }
+
   /// Best-effort native fullscreen for theater mode. window_manager is
   /// initialized on every desktop target; failures are swallowed so a
   /// missing WM backend can never break the lyrics pane.
@@ -352,6 +522,9 @@ class _WaveKaraokeLyricsViewState extends ConsumerState<WaveKaraokeLyricsView>
     _ticker.dispose();
     _interpolatedPositionMs.dispose();
     _activeLine.dispose();
+    try {
+      _lyricController.activeIndexNotifiter.removeListener(_onLyricActiveChanged);
+    } catch (_) {}
     // Leaving karaoke while in theater mode must never strand the
     // window fullscreen with no way back from this pane.
     if (_fullscreen) _setNativeFullscreen(false);
@@ -544,6 +717,7 @@ class _WaveKaraokeLyricsViewState extends ConsumerState<WaveKaraokeLyricsView>
             Expanded(
               child: wordByWord && result.isSynced
                   ? Stack(
+                      key: _lyricStackKey,
                       children: [
                         Positioned.fill(
                           child: MouseRegion(
@@ -553,6 +727,18 @@ class _WaveKaraokeLyricsViewState extends ConsumerState<WaveKaraokeLyricsView>
                               style: style,
                             ),
                           ),
+                        ),
+                        // Resolves the highlighted line's position (in this
+                        // Stack's local coords) and feeds _particleAnchor.
+                        _ParticleAnchorProbe(
+                          enabled: particlesOn,
+                          result: result,
+                          positionListenable: _interpolatedPositionMs,
+                          activeLine: _activeLine,
+                          activeRowKey: _appleActiveRowKey,
+                          stackKey: _lyricStackKey,
+                          wordByWord: true,
+                          onAnchor: (a) => _particleAnchor = a,
                         ),
                         // Particle motes ride above the lyric view for
                         // BOTH modes (karaoke wipe and Apple line-sync),
@@ -588,6 +774,26 @@ class _WaveKaraokeLyricsViewState extends ConsumerState<WaveKaraokeLyricsView>
                       ],
                     )
                   : _AppleLineLyricsView(
+                      stackKey: _lyricStackKey,
+                      activeRowKey: _appleActiveRowKey,
+                      particleClockScopeBuilder: (child) =>
+                          _ParticleClockScope(
+                        enabled: particlesOn,
+                        child: child,
+                      ),
+                      onActiveIndexChanged: (i) {
+                        if (_activeLine.value != i) _activeLine.value = i;
+                      },
+                      anchorProbeBuilder: () => _ParticleAnchorProbe(
+                        enabled: particlesOn,
+                        result: result,
+                        positionListenable: _interpolatedPositionMs,
+                        activeLine: _activeLine,
+                        activeRowKey: _appleActiveRowKey,
+                        stackKey: _lyricStackKey,
+                        wordByWord: false,
+                        onAnchor: (a) => _particleAnchor = a,
+                      ),
                       result: result,
                       positionListenable: _interpolatedPositionMs,
                       activeLineListenable: _activeLine,
@@ -1235,8 +1441,11 @@ class _KaraokeToolbar extends ConsumerWidget {
                   ? 'Exit fullscreen'
                   : 'Fullscreen lyrics (theater mode)',
               child: _MiniIconButton(
+                // NOTE: `FluentIcons.compress` does not exist in the pinned
+                // fluent_ui version and broke the Linux/Windows/macOS builds.
+                // Use `chrome_minimize`, which is present in all versions.
                 icon: fullscreen
-                    ? FluentIcons.compress
+                    ? FluentIcons.chrome_minimize
                     : FluentIcons.full_screen,
                 active: fullscreen,
                 onTap: onToggleFullscreen!,
@@ -1365,6 +1574,14 @@ class _AppleLineLyricsView extends StatefulWidget {
   final bool particlesEnabled;
   final Offset particleAnchor;
   final Color particleColor;
+  // Anchor plumbing shared with the parent karaoke state: keys locating
+  // the lyrics Stack / active row, plus builders for the parent-owned
+  // clock scope and anchor probe (keeps one LyricParticleClock owner).
+  final GlobalKey? stackKey;
+  final GlobalKey? activeRowKey;
+  final Widget Function(Widget child) particleClockScopeBuilder;
+  final Widget Function()? anchorProbeBuilder;
+  final ValueChanged<int>? onActiveIndexChanged;
   final bool compact;
   final double? fontSize;
   final bool showTransliteration;
@@ -1380,6 +1597,11 @@ class _AppleLineLyricsView extends StatefulWidget {
     this.particlesEnabled = false,
     this.particleAnchor = Offset.zero,
     this.particleColor = const Color(0xFFFFB4A2),
+    this.stackKey = null,
+    this.activeRowKey = null,
+    this.particleClockScopeBuilder = _defaultPassthrough,
+    this.anchorProbeBuilder,
+    this.onActiveIndexChanged,
     required this.compact,
     required this.fontSize,
     required this.showTransliteration,
@@ -1388,6 +1610,8 @@ class _AppleLineLyricsView extends StatefulWidget {
     required this.onResume,
     required this.onSeekLineMs,
   });
+
+  static Widget _defaultPassthrough(Widget child) => child;
 
   @override
   State<_AppleLineLyricsView> createState() => _AppleLineLyricsViewState();
@@ -1499,8 +1723,38 @@ class _AppleLineLyricsViewState extends State<_AppleLineLyricsView> {
             untimed: false,
           );
         }
-        return _listCache!;
+        // Mirror the highlighted line to the parent so particle bursts
+        // fire on change (event-driven — only notifies when it differs).
+        try {
+          widget.onActiveIndexChanged?.call(active);
+        } catch (_) {}
+        return _wrapWithParticles(_listCache!, active: active, untimed: false);
       },
+    );
+  }
+
+  Widget _wrapWithParticles(Widget list, {required int active, required bool untimed}) {
+    final progress = widget.activeLineListenable;
+    if (!widget.particlesEnabled || untimed || progress == null) return list;
+    return Stack(
+      key: widget.stackKey,
+      children: [
+        Positioned.fill(child: list),
+        if (widget.anchorProbeBuilder != null) widget.anchorProbeBuilder!(),
+        Positioned.fill(
+          child: IgnorePointer(
+            child: widget.particleClockScopeBuilder(
+              WaveLyricParticles(
+                clock: LyricParticleClock.instance.seconds,
+                progress: progress,
+                anchor: widget.particleAnchor,
+                color: widget.particleColor,
+                enabled: true,
+              ),
+            ),
+          ),
+        ),
+      ],
     );
   }
 
@@ -1511,11 +1765,15 @@ class _AppleLineLyricsViewState extends State<_AppleLineLyricsView> {
   }) {
     Widget lineAt(int i) {
       final line = widget.result.lines[i];
+      final isActive = i == active;
       // Isolate each row: without this, the active line's per-tick
       // repaints (highlight wipe + 16px text shadow) cascade into
       // sibling rows, re-rasterizing the whole pane ~30×/sec.
       return RepaintBoundary(
         child: Padding(
+          // GlobalKey only on the active row so the particle anchor probe
+          // can locate it; inactive rows keep their cheap cached widgets.
+          key: isActive ? widget.activeRowKey : null,
           padding: const EdgeInsets.only(bottom: 4),
           child: MouseRegion(
             cursor: SystemMouseCursors.click,
@@ -1524,7 +1782,7 @@ class _AppleLineLyricsViewState extends State<_AppleLineLyricsView> {
               child: WaveKaraokeLyricLine(
                 line: line,
                 positionMs: posMs,
-                isActive: i == active,
+                isActive: isActive,
                 isPast: !untimed && i < active,
                 compact: widget.compact,
                 fontSize: widget.fontSize,
