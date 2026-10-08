@@ -1,1 +1,4 @@
-(empty)
+# Flutter/Dart build artifacts
+.dart_tool/
+build/
+.flutter-plugins-dependencies
