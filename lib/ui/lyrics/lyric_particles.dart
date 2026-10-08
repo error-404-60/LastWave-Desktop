@@ -1,5 +1,4 @@
 import 'dart:math' as math;
-import 'dart:ui' as ui;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/widgets.dart';
@@ -316,24 +315,24 @@ class _LyricParticlePainter extends CustomPainter {
     for (final p in particles) {
       final fade = p.alpha.clamp(0.0, 1.0);
       if (fade <= 0.01) continue;
-      // Soft mote = unit radial gradient scaled onto the particle via
-      // the canvas transform. Alpha rides inside the shader colors, so
-      // no saveLayerAlpha (which would force an offscreen per mote).
-      // NOTE: use ONLY positional args for Gradient.radial — the named
-      // `colors:`/`stops:` form does not exist in dart:ui and breaks
-      // compilation on stable SDKs. Signature (positional):
-      //   radial(center, radius, colors, [stops?, tileMode?, focalPoint?])
-      scratch.shader = ui.Gradient.radial(
-        Offset.zero, // center
-        1.0, // radius
-        [
-          core.withValues(alpha: 0.9 * fade),
-          core.withValues(alpha: 0.45 * fade),
-          edge,
-        ],
-        const [0.0, 0.5, 1.0], // stops
-      ).createShader(Rect.fromLTWH(-1, -1, 2, 2));
-      canvas.drawCircle(Offset(p.x, p.y), p.drawSize, scratch);
+      // Soft glowing mote drawn as three concentric circles sharing one
+      // Paint (bright core -> mid halo -> transparent edge). This is
+      // intentionally shader-free: constructing a per-particle radial
+      // gradient shader churned the SkSL runtime effect cache and
+      // crashed kernel_snapshot on Linux/Windows/macOS release builds.
+      // No saveLayer needed — plain src-over stacking of alpha-ramped
+      // circles gives the same soft look at a fraction of the cost.
+      final r = p.drawSize;
+      final c = Offset(p.x, p.y);
+      scratch.color = core.withValues(alpha: 0.28 * fade);
+      canvas.drawCircle(c, r, scratch);
+      scratch.color = core.withValues(alpha: 0.45 * fade);
+      canvas.drawCircle(c, r * 0.6, scratch);
+      scratch.color = Color.alphaBlend(
+        core.withValues(alpha: 0.9 * fade),
+        edge,
+      );
+      canvas.drawCircle(c, r * 0.28, scratch);
     }
   }
 
