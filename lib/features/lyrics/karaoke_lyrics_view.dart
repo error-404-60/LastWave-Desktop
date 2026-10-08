@@ -235,14 +235,20 @@ class _ParticleAnchorProbeState extends State<_ParticleAnchorProbe> {
     Offset? found;
     void visit(Element e) {
       if (found != null) return;
-      final w = e.widget;
-      if (w is ListView || w.runtimeType.toString().contains('ListView')) {
-        final ro = e.renderObject;
-        if (ro is RenderAbstractViewport) {
-          final vis = ro.getVisibleBounds(ro);
-          found = Offset(vis.center.dx, vis.center.dy);
-          return;
+      final ro = e.renderObject;
+      // flutter_lyric renders a scrollable list; the first Scrollable under
+      // the karaoke stack is that list. Its own paint bounds in global
+      // coordinates approximate the active-line area (the lyric widget
+      // centers the current line within its viewport).
+      if (ro is RenderBox &&
+          (e.widget is Scrollable ||
+              e.widget.runtimeType.toString().contains('Scrollable'))) {
+        if (ro.hasSize) {
+          final origin = ro.localToGlobal(Offset.zero);
+          found = Offset(origin.dx + ro.size.width * 0.5,
+              origin.dy + ro.size.height * 0.42);
         }
+        return;
       }
       e.visitChildren(visit);
     }
