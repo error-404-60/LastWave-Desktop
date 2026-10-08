@@ -8,6 +8,7 @@ import 'package:flutter_lyric/flutter_lyric.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'package:scrollable_positioned_list/scrollable_positioned_list.dart';
+import 'package:window_manager/window_manager.dart';
 
 import '../../core/audio/stream_models.dart';
 import '../../core/error/fatal_crumbs.dart';
@@ -328,6 +329,21 @@ class _WaveKaraokeLyricsViewState extends ConsumerState<WaveKaraokeLyricsView>
     }
   }
 
+  /// Best-effort native fullscreen for theater mode. window_manager is
+  /// initialized on every desktop target; failures are swallowed so a
+  /// missing WM backend can never break the lyrics pane.
+  Future<void> _setNativeFullscreen(bool on) async {
+    try {
+      await windowManager.setFullScreen(on);
+    } catch (_) {}
+  }
+
+  void _toggleFullscreen() {
+    final next = !_fullscreen;
+    setState(() => _fullscreen = next);
+    _setNativeFullscreen(next);
+  }
+
   @override
   void dispose() {
     _posSub?.close();
@@ -335,6 +351,10 @@ class _WaveKaraokeLyricsViewState extends ConsumerState<WaveKaraokeLyricsView>
     _speedSub?.close();
     _ticker.dispose();
     _interpolatedPositionMs.dispose();
+    _activeLine.dispose();
+    // Leaving karaoke while in theater mode must never strand the
+    // window fullscreen with no way back from this pane.
+    if (_fullscreen) _setNativeFullscreen(false);
     _lyricController.isSelectingNotifier.removeListener(_onSelectingChanged);
     _lyricController.dispose();
     super.dispose();
@@ -414,6 +434,10 @@ class _WaveKaraokeLyricsViewState extends ConsumerState<WaveKaraokeLyricsView>
     // not rebuild the karaoke view (it recreates the lyric adapter).
     final wordByWord =
         ref.watch(prefsProvider.select((p) => p.wordByWord));
+    // Particle toggle lives in its own provider so flipping theme or
+    // quality elsewhere never rebuilds this pane; watching it here is
+    // what makes Settings → "Particle effect in lyrics" apply live.
+    final particlesOn = ref.watch(lyricParticlesProvider);
     final async = ref.watch(waveLyricsProvider(widget.track.queueKey));
 
     _offsetMs = offsetMs;
@@ -505,7 +529,9 @@ class _WaveKaraokeLyricsViewState extends ConsumerState<WaveKaraokeLyricsView>
                 following: _following,
                 compact: widget.compact,
                 wordByWord: wordByWord,
+                fullscreen: _fullscreen,
                 onClose: widget.onClose,
+                onToggleFullscreen: _toggleFullscreen,
                 onToggleFollowing: () {
                   if (!_following) {
                     _lyricController.stopSelection();
@@ -528,6 +554,26 @@ class _WaveKaraokeLyricsViewState extends ConsumerState<WaveKaraokeLyricsView>
                             ),
                           ),
                         ),
+                        // Particle motes ride above the lyric view for
+                        // BOTH modes (karaoke wipe and Apple line-sync),
+                        // anchored to the highlighted line. The clock
+                        // ticker only runs while particles are enabled —
+                        // zero frames when off. IgnorePointer keeps tap-
+                        // to-seek and scrolling exactly as before.
+                        Positioned.fill(
+                          child: IgnorePointer(
+                            child: _ParticleClockScope(
+                              enabled: particlesOn,
+                              child: WaveLyricParticles(
+                                clock: LyricParticleClock.instance.seconds,
+                                progress: _activeLine,
+                                anchor: _particleAnchor,
+                                color: waveAccent(context),
+                                enabled: particlesOn,
+                              ),
+                            ),
+                          ),
+                        ),
                         if (!_following)
                           Positioned(
                             right: 16,
@@ -544,6 +590,10 @@ class _WaveKaraokeLyricsViewState extends ConsumerState<WaveKaraokeLyricsView>
                   : _AppleLineLyricsView(
                       result: result,
                       positionListenable: _interpolatedPositionMs,
+                      activeLineListenable: _activeLine,
+                      particlesEnabled: particlesOn,
+                      particleAnchor: _particleAnchor,
+                      particleColor: waveAccent(context),
                       compact: widget.compact,
                       fontSize: widget.fontSize,
                       showTransliteration: showTransliteration,
@@ -1023,8 +1073,10 @@ class _KaraokeToolbar extends ConsumerWidget {
   final bool following;
   final bool compact;
   final bool wordByWord;
+  final bool fullscreen;
   final VoidCallback? onClose;
   final VoidCallback onToggleFollowing;
+  final VoidCallback? onToggleFullscreen;
 
   const _KaraokeToolbar({
     required this.track,
@@ -1034,8 +1086,10 @@ class _KaraokeToolbar extends ConsumerWidget {
     required this.following,
     required this.compact,
     this.wordByWord = true,
+    this.fullscreen = false,
     this.onClose,
     required this.onToggleFollowing,
+    this.onToggleFullscreen,
   });
 
   @override
@@ -1174,6 +1228,21 @@ class _KaraokeToolbar extends ConsumerWidget {
               onTap: onToggleFollowing,
             ),
           ),
+          if (onToggleFullscreen != null) ...[
+            const SizedBox(width: 4),
+            LWTooltip(
+              message: fullscreen
+                  ? 'Exit fullscreen'
+                  : 'Fullscreen lyrics (theater mode)',
+              child: _MiniIconButton(
+                icon: fullscreen
+                    ? FluentIcons.compress
+                    : FluentIcons.full_screen,
+                active: fullscreen,
+                onTap: onToggleFullscreen!,
+              ),
+            ),
+          ],
           if (onClose != null) ...[
             const SizedBox(width: 6),
             LWTooltip(
@@ -1290,6 +1359,12 @@ class _ReturnToCurrentPill extends StatelessWidget {
 class _AppleLineLyricsView extends StatefulWidget {
   final LyricsResult result;
   final ValueNotifier<int> positionListenable;
+  /// Mirrors the active line index so particle bursts fire on highlight
+  /// changes without rebuilding the row list (rows are cached anyway).
+  final ValueNotifier<int>? activeLineListenable;
+  final bool particlesEnabled;
+  final Offset particleAnchor;
+  final Color particleColor;
   final bool compact;
   final double? fontSize;
   final bool showTransliteration;
@@ -1301,6 +1376,10 @@ class _AppleLineLyricsView extends StatefulWidget {
   const _AppleLineLyricsView({
     required this.result,
     required this.positionListenable,
+    this.activeLineListenable,
+    this.particlesEnabled = false,
+    this.particleAnchor = Offset.zero,
+    this.particleColor = const Color(0xFFFFB4A2),
     required this.compact,
     required this.fontSize,
     required this.showTransliteration,

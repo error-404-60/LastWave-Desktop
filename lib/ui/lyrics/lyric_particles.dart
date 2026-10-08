@@ -319,16 +319,19 @@ class _LyricParticlePainter extends CustomPainter {
       // Soft mote = unit radial gradient scaled onto the particle via
       // the canvas transform. Alpha rides inside the shader colors, so
       // no saveLayerAlpha (which would force an offscreen per mote).
+      // NOTE: use ONLY positional args for Gradient.radial — the named
+      // `colors:`/`stops:` form does not exist in dart:ui and breaks
+      // compilation on stable SDKs. Signature (positional):
+      //   radial(center, radius, colors, [stops?, tileMode?, focalPoint?])
       scratch.shader = ui.Gradient.radial(
         Offset.zero, // center
         1.0, // radius
-        Offset.zero, // focalPoint (required by newer Flutter SDKs)
-        colors: [
+        [
           core.withValues(alpha: 0.9 * fade),
           core.withValues(alpha: 0.45 * fade),
           edge,
         ],
-        stops: const [0.0, 0.5, 1.0],
+        const [0.0, 0.5, 1.0], // stops
       ).createShader(Rect.fromLTWH(-1, -1, 2, 2));
       canvas.drawCircle(Offset(p.x, p.y), p.drawSize, scratch);
     }
