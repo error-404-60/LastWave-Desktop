@@ -286,6 +286,14 @@ class Prefs {
 
   Future<void> setCdMode(bool v) => _sp.setBool('lw_cd_mode', v);
 
+  /// "Particle effect in lyrics": shimmering motes around the
+  /// highlighted lyric line. Off by default — opt-in from Settings →
+  /// Lyrics (or the Now Playing toolbar toggle).
+  bool get lyricParticles => _sp.getBool('lw_lyric_particles') ?? false;
+
+  Future<void> setLyricParticles(bool v) =>
+      _sp.setBool('lw_lyric_particles', v);
+
   // -- Discord Rich Presence --------------------------------------------------
   /// Show the current track in Discord status. Default on (Spotify parity).
   bool get discordRichPresence =>
