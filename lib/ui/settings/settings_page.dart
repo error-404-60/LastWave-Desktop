@@ -24,6 +24,7 @@ import '../../features/lastfm/auth_repository.dart';
 import '../../features/settings/theme_controller.dart';
 import '../../features/audio_output/output_controller.dart';
 import '../../features/audio_output/output_path_sheet.dart';
+import '../../features/lyrics/karaoke_lyrics_view.dart';
 import '../../features/lyrics/lyrics_providers.dart';
 import '../theme/tokens.dart';
 import '../theme/brand_icons.dart';
@@ -746,6 +747,18 @@ class _Lyrics extends ConsumerWidget {
             onChanged: (v) => onUpdate((p) => p.setWordByWord(v)),
             title: 'Word-by-word lyrics',
             subtitle: 'Karaoke word highlight. Off uses Apple Music line lyrics.',
+          ),
+          _SwitchRow(
+            value: prefs.lyricParticles,
+            onChanged: (v) {
+              onUpdate((p) => p.setLyricParticles(v));
+              // Keep the live karaoke panes in sync with the persisted
+              // preference (they watch lyricParticlesProvider).
+              ref.read(lyricParticlesProvider.notifier).setEnabled(v);
+            },
+            title: 'Particle effect in lyrics',
+            subtitle:
+                'Shimmering motes drift off the highlighted lyric line.',
           ),
           const SizedBox(height: 10),
           const Text('Primary provider', style: WaveType.trackTitle),

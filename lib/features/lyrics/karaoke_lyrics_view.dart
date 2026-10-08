@@ -39,29 +39,51 @@ class LyricParticleClock {
   Ticker? _ticker;
   TickerProvider? _provider;
   int _consumers = 0;
+  // Consumers that have particles switched ON. The ticker only runs
+  // while at least one is active — the effect costs zero frames when
+  // every pane has it disabled.
+  int _enabledConsumers = 0;
   DateTime _lastWall = DateTime.now();
 
-  void acquire(TickerProvider provider) {
+  void acquire(TickerProvider provider, {required bool enabled}) {
     _consumers++;
-    // Prefer the first provider that actually ticks; if it later goes
-    // away with consumers still attached, re-arm from the next one.
-    if (_ticker == null || !_ticker!.isActive) {
-      _provider = provider;
-      _ticker?.dispose();
-      _ticker = provider.createTicker(_onTick)..start();
+    if (enabled) _enabledConsumers++;
+    _arm(provider);
+  }
+
+  void updateRegistration({required bool enabled}) {
+    _enabledConsumers += enabled ? 1 : -1;
+    if (_enabledConsumers < 0) _enabledConsumers = 0;
+    if (_enabledConsumers > 0) {
+      if (_provider != null) _arm(_provider!);
+    } else {
+      _ticker?.stop();
     }
   }
 
   void release() {
     _consumers--;
+    _enabledConsumers--;
+    if (_enabledConsumers < 0) _enabledConsumers = 0;
     if (_consumers <= 0) {
       _consumers = 0;
+      _enabledConsumers = 0;
       _ticker?.stop();
-    } else if (_provider == this && _consumers > 0) {
-      // Shouldn't happen (providers outlive acquires in practice), but
-      // keep the clock alive rather than silently freezing particles.
-      _ticker?.stop();
+    } else if (_enabledConsumers > 0 && (_ticker == null || !_ticker!.isActive)) {
+      // Keep the clock alive rather than silently freezing particles.
+      if (_provider != null) _arm(_provider!);
     }
+  }
+
+  void _arm(TickerProvider provider) {
+    if (_enabledConsumers <= 0) return;
+    if (_ticker != null && _ticker!.isActive && identical(_provider, provider)) {
+      return;
+    }
+    _provider = provider;
+    _ticker?.dispose();
+    _lastWall = DateTime.now();
+    _ticker = provider.createTicker(_onTick)..start();
   }
 
   void _onTick(Duration _) {
@@ -78,10 +100,11 @@ class LyricParticleClock {
 
 /// Widget-scoped registration with the shared particle clock: mounts a
 /// [WaveLyricParticles] without forcing its owner to own a Ticker or
-/// rebuild per frame.
+/// rebuild per frame. The clock only ticks while [enabled] is true.
 class _ParticleClockScope extends StatefulWidget {
   final Widget child;
-  const _ParticleClockScope({required this.child});
+  final bool enabled;
+  const _ParticleClockScope({required this.child, required this.enabled});
 
   @override
   State<_ParticleClockScope> createState() => _ParticleClockScopeState();
@@ -89,10 +112,21 @@ class _ParticleClockScope extends StatefulWidget {
 
 class _ParticleClockScopeState extends State<_ParticleClockScope>
     with SingleTickerProviderStateMixin {
+  late bool _registeredEnabled;
+
   @override
   void initState() {
     super.initState();
-    LyricParticleClock.instance.acquire(this);
+    _registeredEnabled = widget.enabled;
+    LyricParticleClock.instance.acquire(this, enabled: _registeredEnabled);
+  }
+
+  @override
+  void didUpdateWidget(covariant _ParticleClockScope oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.enabled != widget.enabled) {
+      LyricParticleClock.instance.updateRegistration(enabled: widget.enabled);
+    }
   }
 
   @override
@@ -243,6 +277,13 @@ class _WaveKaraokeLyricsViewState extends ConsumerState<WaveKaraokeLyricsView>
   LyricsResult? _currentResult;
   bool _lastTransliteration = true;
   bool _lastWordByWord = true;
+  // Fullscreen (theater) mode for the lyrics + poster screen.
+  bool _fullscreen = false;
+  // Active lyric line index — drives particle bursts on highlight change.
+  final ValueNotifier<int> _activeLine = ValueNotifier<int>(-1);
+  // Anchor of the highlighted line in the lyrics Stack's local coords,
+  // refreshed by a lightweight post-frame probe (no extra listeners).
+  Offset _particleAnchor = const Offset(-1, -1);
 
   @override
   void initState() {
@@ -609,6 +650,10 @@ class WaveKaraokeLyricLine extends StatefulWidget {
   final bool karaoke;
   final bool softenIdle;
 
+  /// Reports the highlighted line's rect (in the enclosing lyrics Stack's
+  /// local coordinates) so the particle effect can anchor bursts on it.
+  final void Function(Rect lineRect)? onActiveRect;
+
   const WaveKaraokeLyricLine({
     super.key,
     required this.line,
@@ -621,6 +666,7 @@ class WaveKaraokeLyricLine extends StatefulWidget {
     this.fontSize,
     this.karaoke = true,
     this.softenIdle = true,
+    this.onActiveRect,
   });
 
   @override
@@ -792,25 +838,47 @@ class _WaveKaraokeLyricLineState extends State<WaveKaraokeLyricLine> {
     return MouseRegion(
       onEnter: (_) => setState(() => _isHovered = true),
       onExit: (_) => setState(() => _isHovered = false),
-      child: AnimatedContainer(
-        duration: WaveMotion.normal,
-        curve: Curves.easeOutCubic,
-        transform: Matrix4.diagonal3Values(
-          widget.isActive ? 1.025 : 1.0,
-          widget.isActive ? 1.025 : 1.0,
-          1.0,
-        ),
-        padding: EdgeInsets.symmetric(
-          horizontal: widget.compact ? 8 : 12,
-          vertical: widget.karaoke ? 4 : 8,
-        ),
-        decoration: BoxDecoration(
-          color: _isHovered && !widget.isActive
-              ? (dark ? Colors.white : Colors.black).withValues(alpha: 0.06)
-              : Colors.transparent,
-          borderRadius: BorderRadius.circular(10),
-        ),
-        child: body,
+      child: Builder(
+        builder: (context) {
+          // Cheap post-frame probe: only the ACTIVE line reports its
+          // rect, and only when particles are listening for it. One
+          // localToFrame per highlight change — no listeners, no
+          // per-frame cost.
+          if (widget.isActive && widget.onActiveRect != null) {
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              if (!mounted) return;
+              final ro = context.findRenderObject();
+              final cb = widget.onActiveRect;
+              if (ro is RenderBox && ro.hasSize && cb != null) {
+                try {
+                  cb(ro.localToGlobal(Offset.zero) & ro.size);
+                } catch (_) {
+                  // Detached mid-frame: skip this report.
+                }
+              }
+            });
+          }
+          return AnimatedContainer(
+            duration: WaveMotion.normal,
+            curve: Curves.easeOutCubic,
+            transform: Matrix4.diagonal3Values(
+              widget.isActive ? 1.025 : 1.0,
+              widget.isActive ? 1.025 : 1.0,
+              1.0,
+            ),
+            padding: EdgeInsets.symmetric(
+              horizontal: widget.compact ? 8 : 12,
+              vertical: widget.karaoke ? 4 : 8,
+            ),
+            decoration: BoxDecoration(
+              color: _isHovered && !widget.isActive
+                  ? (dark ? Colors.white : Colors.black).withValues(alpha: 0.06)
+                  : Colors.transparent,
+              borderRadius: BorderRadius.circular(10),
+            ),
+            child: body,
+          );
+        },
       ),
     );
   }

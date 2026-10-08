@@ -1,6 +1,7 @@
 import 'dart:math' as math;
 import 'dart:ui' as ui;
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/widgets.dart';
 
 /// "Particle effect in lyrics" — shimmering motes that drift off the
@@ -319,8 +320,9 @@ class _LyricParticlePainter extends CustomPainter {
       // the canvas transform. Alpha rides inside the shader colors, so
       // no saveLayerAlpha (which would force an offscreen per mote).
       scratch.shader = ui.Gradient.radial(
-        Offset.zero,
-        1.0,
+        Offset.zero, // center
+        1.0, // radius
+        Offset.zero, // focalPoint (required by newer Flutter SDKs)
         colors: [
           core.withValues(alpha: 0.9 * fade),
           core.withValues(alpha: 0.45 * fade),
