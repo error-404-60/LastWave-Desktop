@@ -3,20 +3,26 @@ import 'dart:math' as math;
 import 'package:flutter/foundation.dart';
 import 'package:flutter/widgets.dart';
 
-/// "Particle effect in lyrics" — shimmering motes that drift off the
-/// highlighted (active) lyric line.
+/// "Particle effect in lyrics" — Apple-Music-style sparkles that drift
+/// off the highlighted (active) lyric line.
+///
+/// Look: quiet between lines, then a dense fan of rising, twinkling
+/// embers every time the highlight changes — like the shimmer that
+/// lifts off each sung line in Apple Music karaoke. Bursts spread
+/// horizontally across the line via [burstWidth] so they read as a
+/// ribbon of sparks rather than a single point.
 ///
 /// Performance contract:
 /// - One [CustomPainter] inside a [RepaintBoundary]; zero widget
 ///   rebuilds per frame — it is driven by a [Listenable] clock whose
 ///   `.value` is elapsed seconds (an [Animation<double>] or a
 ///   [ValueListenable<double>] both work).
-/// - Particles are emitted at a fixed cadence and capped at
-///   [LyricParticleField.maxCount], so cost stays O(cap) no matter how
-///   many syllables get sung.
-/// - Each particle is one `drawCircle` with a shared unit-radial-shader
-///   scaled through the canvas transform — no per-particle saveLayer,
-///   no blur filters. Cheap on Impeller and ANGLE alike.
+/// - Emission is event-driven (bursts on highlight change) plus a low
+///   ambient cadence, hard-capped at [LyricParticleField.maxCount], so
+///   cost stays O(cap) no matter how many syllables get sung.
+/// - Each particle is three `drawCircle`s sharing one Paint — no
+///   shaders, no per-particle saveLayer, no blur filters. Cheap on
+///   Impeller and ANGLE alike.
 /// - When [enabled] is false nothing mounts and listeners do no work:
 ///   the effect costs literally zero while off.
 ///
@@ -27,12 +33,18 @@ class WaveLyricParticles extends StatefulWidget {
   final Listenable clock;
 
   /// Notifier for the active lyric line index. Every change emits a
-  /// fresh burst anchored at [anchor]; constant values idle with
-  /// ambient particles only.
+  /// fresh sparkle burst anchored at [anchor]; constant values idle
+  /// with ambient particles only.
   final ValueListenable<int>? progress;
 
-  /// Where bursts spawn, in this widget's local pixel coordinates.
+  /// Center where bursts spawn, in this widget's local pixel
+  /// coordinates. Negative anchors are ignored (unresolved probe).
   final Offset anchor;
+
+  /// Approximate width of the highlighted line in the same local
+  /// pixel space. Bursts spread across [-burstWidth/2, +burstWidth/2]
+  /// around [anchor] to mimic Apple Music's line-wide shimmer.
+  final double burstWidth;
 
   final Color color;
   final bool enabled;
@@ -45,6 +57,7 @@ class WaveLyricParticles extends StatefulWidget {
     required this.clock,
     this.progress,
     this.anchor = Offset.zero,
+    this.burstWidth = 0,
     this.color = const Color(0xFFFFB4A2),
     this.enabled = true,
     this.intensity = 1.0,
@@ -110,9 +123,13 @@ class _WaveLyricParticlesState extends State<WaveLyricParticles> {
     final first = _lastProgress == _noProgress;
     _lastProgress = v;
     if (first) return; // initial value is not a highlight change
+    // Unresolved anchor (-1,-1): the probe hasn't located the line yet
+    // this frame — skip rather than sparkle from the top-left corner.
+    if (widget.anchor.dx < 0 || widget.anchor.dy < 0) return;
     _field.emitBurst(
       widget.anchor,
-      count: (16 * widget.intensity).clamp(6, 28).round(),
+      width: widget.burstWidth,
+      count: (26 * widget.intensity).clamp(8, 40).round(),
     );
     _schedulePaint();
   }
@@ -159,7 +176,6 @@ class LyricParticleField {
 
   final List<_Particle> _particles = <_Particle>[];
   double _lastStepSec = -1;
-  double _emitAccumulator = 0;
 
   /// Number of live particles (for tests / debug overlays).
   int get count => _particles.length;
@@ -173,22 +189,12 @@ class LyricParticleField {
   void step(double elapsedSec) {
     if (_lastStepSec < 0) {
       _lastStepSec = elapsedSec;
-      _seedAmbient(elapsedSec);
       return;
     }
     var dt = elapsedSec - _lastStepSec;
     if (dt <= 0) return; // monotonic clocks only; ignore rewinds
     if (dt > 0.2) dt = 0.2;
     _lastStepSec = elapsedSec;
-
-    // Fixed-cadence ambient emission (~14/s) keeps a gentle sparkle
-    // alive between bursts without unbounded growth.
-    _emitAccumulator += dt;
-    const period = 1 / 14;
-    while (_emitAccumulator >= period) {
-      _emitAccumulator -= period;
-      _spawn(_ambientOrigin(elapsedSec), elapsedSec, ambient: true);
-    }
 
     for (var i = _particles.length - 1; i >= 0; i--) {
       final p = _particles[i];
@@ -207,13 +213,24 @@ class LyricParticleField {
     }
   }
 
-  /// Emits a radial burst at [origin] (call on every highlight change).
-  void emitBurst(Offset origin, {int count = 16}) {
-    final n = count.clamp(4, 28);
+  /// Emits an Apple-Music-style sparkle burst along the highlighted
+  /// line at [origin]: particles fan out across ±[width]/2 horizontally
+  /// (so the whole line shimmers, not one point) and drift upward like
+  /// embers. [width] <= 0 falls back to a tight radial fan.
+  void emitBurst(Offset origin, {int count = 26, double width = 0}) {
+    final n = count.clamp(4, 40);
+    final t0 = _lastStepSec < 0 ? 0 : _lastStepSec;
     for (var i = 0; i < n; i++) {
       // Seed each spawn differently so the burst fans out, not clones.
-      _spawn(origin, (_lastStepSec < 0 ? 0 : _lastStepSec) + i * 0.77,
-          ambient: false);
+      final jitter = width > 0
+          ? (i / (n - 1) - 0.5) * width + (_rand(t0 + i * 1.31) - 0.5) * 18
+          : 0.0;
+      _spawn(
+        Offset(origin.dx + jitter,
+            origin.dy + (_rand(i * 0.77 + t0) - 0.5) * 10),
+        t0 + i * 0.31,
+        ambient: false,
+      );
     }
   }
 
@@ -224,8 +241,8 @@ class LyricParticleField {
   }
 
   Offset _ambientOrigin(double t) {
-    // Ambient embers rise from a drifting band around the middle of
-    // the pane, in local pixel space.
+    // Unused in the event-driven Apple-style mode; kept so headless
+    // tests can still exercise ambient spawning deterministically.
     final a = t * 0.6;
     return Offset(
       140 + 110 * math.sin(a),

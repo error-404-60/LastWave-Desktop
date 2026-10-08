@@ -444,6 +444,12 @@ class _WaveKaraokeLyricsViewState extends ConsumerState<WaveKaraokeLyricsView>
   // Anchor of the highlighted line in the lyrics Stack's local coords,
   // refreshed by a lightweight post-frame probe (no extra listeners).
   Offset _particleAnchor = const Offset(-1, -1);
+  // Width of the highlighted line (same local space) so sparkle bursts
+  // fan across the whole line, Apple-Music style.
+  double _particleBurstWidth = 0;
+  // Word-level progress (0..1 * 64) of the active karaoke line; every
+  // increment fires a small mid-line burst so sparkles trail the wipe.
+  final ValueNotifier<int> _karaokeWordStep = ValueNotifier<int>(0);
   // Keys used by the anchor probe to locate the highlighted line.
   final GlobalKey _lyricStackKey = GlobalKey();
   final GlobalKey _appleActiveRowKey = GlobalKey();
@@ -470,6 +476,10 @@ class _WaveKaraokeLyricsViewState extends ConsumerState<WaveKaraokeLyricsView>
 
     _lyricController.isSelectingNotifier.addListener(_onSelectingChanged);
     _ticker = createTicker(_onTick);
+    // Word-level karaoke progress: ValueNotifier fires only when the
+    // quantized syllable step changes (~once per word), so particle
+    // bursts can trail the wipe without any per-tick widget rebuilds.
+    _lyricController.progressNotifier.addListener(_onKaraokeProgress);
     // Subscribe without rebuilding: each emission only re-syncs the
     // interpolation clock (same math the in-build block used to run).
     _posSub = ref.listenManual(
@@ -502,6 +512,19 @@ class _WaveKaraokeLyricsViewState extends ConsumerState<WaveKaraokeLyricsView>
     try {
       final idx = _lyricController.activeIndexNotifiter.value;
       if (_activeLine.value != idx) _activeLine.value = idx;
+    } catch (_) {}
+  }
+
+  /// Word-by-word karaoke: quantize the wipe progress into ~64 steps per
+  /// line and push it to [_karaokeWordStep]. ValueNotifier dedupes, so
+  /// listeners fire at most once per syllable — sparkles trail each sung
+  /// word instead of only bursting on line changes.
+  void _onKaraokeProgress() {
+    try {
+      final p = _lyricController.progressNotifier.value.inMilliseconds /
+          10000.0;
+      final step = (p.clamp(0.0, 1.0) * 64).round();
+      if (_karaokeWordStep.value != step) _karaokeWordStep.value = step;
     } catch (_) {}
   }
 
