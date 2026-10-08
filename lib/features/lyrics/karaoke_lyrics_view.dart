@@ -15,6 +15,7 @@ import '../../core/storage/prefs.dart';
 import '../../ui/components/buttons.dart' show LWTooltip;
 import '../../ui/components/menus.dart' show fastFlyoutTransition;
 import '../../ui/components/states.dart';
+import '../../ui/lyrics/lyric_particles.dart';
 import '../../ui/lyrics/lyrics_panel.dart';
 import '../../ui/theme/haze.dart';
 import '../../ui/theme/tokens.dart';
@@ -23,6 +24,86 @@ import '../player/playback_service.dart';
 import 'flutter_lyric_adapter.dart';
 import 'lyrics_models.dart';
 import 'lyrics_providers.dart';
+
+/// Shared, monotonic seconds clock for the lyric particle effect.
+/// One [Ticker] drives every active [WaveLyricParticles] instance
+/// (side panel + Now Playing can coexist), so cost stays O(1) no
+/// matter how many panes are mounted. The ticker only runs while at
+/// least one pane has particles enabled — zero frames when off.
+class LyricParticleClock {
+  LyricParticleClock._();
+
+  static final LyricParticleClock instance = LyricParticleClock._();
+
+  final ValueNotifier<double> seconds = ValueNotifier<double>(0);
+  Ticker? _ticker;
+  TickerProvider? _provider;
+  int _consumers = 0;
+  DateTime _lastWall = DateTime.now();
+
+  void acquire(TickerProvider provider) {
+    _consumers++;
+    // Prefer the first provider that actually ticks; if it later goes
+    // away with consumers still attached, re-arm from the next one.
+    if (_ticker == null || !_ticker!.isActive) {
+      _provider = provider;
+      _ticker?.dispose();
+      _ticker = provider.createTicker(_onTick)..start();
+    }
+  }
+
+  void release() {
+    _consumers--;
+    if (_consumers <= 0) {
+      _consumers = 0;
+      _ticker?.stop();
+    } else if (_provider == this && _consumers > 0) {
+      // Shouldn't happen (providers outlive acquires in practice), but
+      // keep the clock alive rather than silently freezing particles.
+      _ticker?.stop();
+    }
+  }
+
+  void _onTick(Duration _) {
+    final wall = DateTime.now();
+    var dt = wall.difference(_lastWall).inMicroseconds / 1e6;
+    _lastWall = wall;
+    // Clamp long stalls (minimized window) so the field never sees a
+    // giant step; the field clamps too, this keeps the clock sane.
+    if (dt < 0) dt = 0;
+    if (dt > 0.25) dt = 0.25;
+    seconds.value += dt;
+  }
+}
+
+/// Widget-scoped registration with the shared particle clock: mounts a
+/// [WaveLyricParticles] without forcing its owner to own a Ticker or
+/// rebuild per frame.
+class _ParticleClockScope extends StatefulWidget {
+  final Widget child;
+  const _ParticleClockScope({required this.child});
+
+  @override
+  State<_ParticleClockScope> createState() => _ParticleClockScopeState();
+}
+
+class _ParticleClockScopeState extends State<_ParticleClockScope>
+    with SingleTickerProviderStateMixin {
+  @override
+  void initState() {
+    super.initState();
+    LyricParticleClock.instance.acquire(this);
+  }
+
+  @override
+  void dispose() {
+    LyricParticleClock.instance.release();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => widget.child;
+}
 
 /// Provider for track-specific lyrics timing offset in milliseconds.
 final lyricsOffsetProvider = StateNotifierProvider.family<LyricsOffsetNotifier, int, String>(
@@ -72,6 +153,31 @@ class LyricsTransliterationNotifier extends StateNotifier<bool> {
   void toggle() {
     state = !state;
     _prefs.setLyricsTransliteration(state);
+  }
+}
+
+/// Provider for the "Particle effect in lyrics" toggle (persisted).
+/// When enabled, shimmering motes drift off the highlighted lyric line.
+final lyricParticlesProvider =
+    StateNotifierProvider<LyricParticlesNotifier, bool>((ref) {
+  final prefs = ref.watch(prefsProvider);
+  return LyricParticlesNotifier(prefs);
+});
+
+class LyricParticlesNotifier extends StateNotifier<bool> {
+  final Prefs _prefs;
+
+  LyricParticlesNotifier(this._prefs) : super(_prefs.lyricParticles);
+
+  void toggle() {
+    state = !state;
+    _prefs.setLyricParticles(state);
+  }
+
+  void setEnabled(bool enabled) {
+    if (state == enabled) return;
+    state = enabled;
+    _prefs.setLyricParticles(enabled);
   }
 }
 
